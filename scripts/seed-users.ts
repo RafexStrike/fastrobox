@@ -28,18 +28,25 @@ async function main() {
       password: env.SEED_TEACHER_PASSWORD,
     },
     {
-      fullName: "Fastrobox Student",
-      username: "student",
-      email: "student@example.test",
+      fullName: "Student S1",
+      username: "student-s1",
+      email: "student-s1@example.test",
       role: "STUDENT",
-      password: env.SEED_STUDENT_PASSWORD,
+      password: env.SEED_S1_PASSWORD ?? env.SEED_STUDENT_PASSWORD,
     },
     {
-      fullName: "Fastrobox Guardian",
-      username: "guardian",
-      email: "guardian@example.test",
+      fullName: "Student S2",
+      username: "student-s2",
+      email: "student-s2@example.test",
+      role: "STUDENT",
+      password: env.SEED_S2_PASSWORD ?? env.SEED_STUDENT_PASSWORD,
+    },
+    {
+      fullName: "Guardian S1",
+      username: "guardian-s1",
+      email: "guardian-s1@example.test",
       role: "GUARDIAN",
-      password: env.SEED_GUARDIAN_PASSWORD,
+      password: env.SEED_GUARDIAN_S1_PASSWORD ?? env.SEED_GUARDIAN_PASSWORD,
     },
   ] as const;
 
@@ -75,6 +82,33 @@ async function main() {
 
       console.info(
         `${result.rowCount === 1 ? "Created" : "Skipped existing"} ${account.role} test user.`,
+      );
+    }
+
+    const teacherRow = await pool.query<{ id: string }>(
+      `SELECT id FROM users WHERE username = 'teacher' LIMIT 1`,
+    );
+    if (teacherRow.rowCount === 1) {
+      await pool.query(
+        `INSERT INTO teacher_room_access (teacher_id, room_id)
+         VALUES ($1, 'room-01')
+         ON CONFLICT DO NOTHING`,
+        [teacherRow.rows[0].id],
+      );
+    }
+
+    const guardianRow = await pool.query<{ id: string }>(
+      `SELECT id FROM users WHERE username = 'guardian-s1' LIMIT 1`,
+    );
+    const studentRow = await pool.query<{ id: string }>(
+      `SELECT id FROM users WHERE username = 'student-s1' LIMIT 1`,
+    );
+    if (guardianRow.rowCount === 1 && studentRow.rowCount === 1) {
+      await pool.query(
+        `INSERT INTO guardian_children (guardian_id, student_id)
+         VALUES ($1, $2)
+         ON CONFLICT DO NOTHING`,
+        [guardianRow.rows[0].id, studentRow.rows[0].id],
       );
     }
   } finally {

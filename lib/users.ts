@@ -1,14 +1,18 @@
 import "server-only";
 import { compare, hash } from "bcryptjs";
 import { pool } from "@/lib/db";
-import type { UserRole } from "@/lib/roles";
+import { isSelfRegisterableRole, type UserRole } from "@/lib/roles";
+
+export const MAX_FAILED_LOGIN_ATTEMPTS = 5;
+export const LOCKOUT_SECONDS = 30;
 
 type LoginRow = {
   id: string;
   username: string;
   password_hash: string;
   role: UserRole;
-  is_locked: boolean;
+  failed_login_attempts: number;
+  locked_until: string | null;
 };
 
 export type AuthenticatedUser = {
@@ -28,11 +32,25 @@ export type RegistrationInput = {
 
 export type RegistrationResult =
   | { created: true }
-  | { created: false; usernameTaken: boolean; emailTaken: boolean };
+  | {
+      created: false;
+      usernameTaken: boolean;
+      emailTaken: boolean;
+      roleRestricted?: boolean;
+    };
 
 export async function registerUser(
   input: RegistrationInput,
 ): Promise<RegistrationResult> {
+  if (!isSelfRegisterableRole(input.role)) {
+    return {
+      created: false,
+      usernameTaken: false,
+      emailTaken: false,
+      roleRestricted: true,
+    };
+  }
+
   const existing = await pool.query<{
     username_taken: boolean;
     email_taken: boolean;
@@ -78,21 +96,40 @@ export async function registerUser(
   return { created: true };
 }
 
-export async function authenticateUser(
-  identifier: string,
-  password: string,
-) {
+export async function authenticateUser(identifier: string, password: string) {
+  const normalizedIdentifier = identifier.trim();
+  if (!normalizedIdentifier) {
+    return null;
+  }
+
   const result = await pool.query<LoginRow>(
-    `SELECT id, username, password_hash, role,
-            locked_until > clock_timestamp() AS is_locked
+    `SELECT id, username, password_hash, role, failed_login_attempts, locked_until
        FROM users
-      WHERE lower(username) = $1 OR lower(email) = $1
+      WHERE lower(username) = lower($1) OR lower(email) = lower($1)
       LIMIT 1`,
-    [identifier.trim().toLowerCase()],
+    [normalizedIdentifier],
   );
   const user = result.rows[0];
 
-  if (!user || user.is_locked) {
+  if (!user) {
+    await recordLoginAttempt({
+      username: normalizedIdentifier,
+      success: false,
+      reason: "unknown-user",
+    });
+    return null;
+  }
+
+  const lockExpiresAt = user.locked_until ? new Date(user.locked_until) : null;
+  const isLocked = lockExpiresAt !== null && lockExpiresAt > new Date();
+
+  if (isLocked) {
+    await recordLoginAttempt({
+      userId: user.id,
+      username: user.username,
+      success: false,
+      reason: "locked",
+    });
     return null;
   }
 
@@ -101,24 +138,24 @@ export async function authenticateUser(
     (await compare(password, user.password_hash));
 
   if (!passwordMatches) {
-    await recordFailedLogin(user.id);
+    await recordFailedLogin(user.id, user.username);
     return null;
   }
 
-  const reset = await pool.query(
+  await pool.query(
     `UPDATE users
         SET failed_login_attempts = 0,
             locked_until = NULL,
             updated_at = clock_timestamp()
-      WHERE id = $1
-        AND (locked_until IS NULL OR locked_until <= clock_timestamp())
-      RETURNING id`,
+      WHERE id = $1`,
     [user.id],
   );
 
-  if (reset.rowCount !== 1) {
-    return null;
-  }
+  await recordLoginAttempt({
+    userId: user.id,
+    username: user.username,
+    success: true,
+  });
 
   return { id: user.id, role: user.role };
 }
@@ -134,6 +171,36 @@ export async function findUserById(id: string): Promise<AuthenticatedUser | null
   return result.rows[0] ?? null;
 }
 
+export async function getLoginHistory(limit = 50): Promise<
+  Array<{
+    id: string;
+    username: string | null;
+    user_id: string | null;
+    success: boolean;
+    reason: string | null;
+    created_at: string;
+  }>
+> {
+  const result = await pool.query(
+    `SELECT id, username, user_id, success, reason, created_at
+       FROM login_history
+      ORDER BY created_at DESC
+      LIMIT $1`,
+    [limit],
+  );
+
+  return result.rows;
+}
+
+export function getLoginLockoutDeadline(user: { locked_until: string | null } | null): Date | null {
+  if (!user?.locked_until) {
+    return null;
+  }
+
+  const value = new Date(user.locked_until);
+  return Number.isNaN(value.getTime()) ? null : value;
+}
+
 function isUniqueViolation(
   error: unknown,
 ): error is { code: string; constraint?: string } {
@@ -145,7 +212,7 @@ function isUniqueViolation(
   );
 }
 
-async function recordFailedLogin(id: string) {
+async function recordFailedLogin(id: string, username: string) {
   await pool.query(
     `WITH locked_account AS MATERIALIZED (
        SELECT id, failed_login_attempts, locked_until
@@ -160,21 +227,45 @@ async function recordFailedLogin(id: string) {
      )
      UPDATE users AS account
         SET failed_login_attempts = CASE
-              WHEN attempt.locked_until > attempt.now
+              WHEN attempt.locked_until IS NOT NULL AND attempt.locked_until > attempt.now
                 THEN attempt.failed_login_attempts
               WHEN attempt.locked_until IS NOT NULL THEN 1
-              ELSE LEAST(attempt.failed_login_attempts + 1, 3)
+              ELSE LEAST(attempt.failed_login_attempts + 1, ${MAX_FAILED_LOGIN_ATTEMPTS})
             END,
             locked_until = CASE
-              WHEN attempt.locked_until > attempt.now THEN attempt.locked_until
-              WHEN attempt.locked_until IS NOT NULL THEN NULL
-              WHEN attempt.failed_login_attempts >= 2
-                THEN attempt.now + INTERVAL '60 seconds'
+              WHEN attempt.locked_until IS NOT NULL AND attempt.locked_until > attempt.now THEN attempt.locked_until
+              WHEN attempt.failed_login_attempts + 1 >= ${MAX_FAILED_LOGIN_ATTEMPTS}
+                THEN attempt.now + INTERVAL '${LOCKOUT_SECONDS} seconds'
               ELSE NULL
             END,
             updated_at = attempt.now
        FROM attempt
       WHERE account.id = attempt.id`,
     [id],
+  );
+
+  await recordLoginAttempt({
+    userId: id,
+    username,
+    success: false,
+    reason: "invalid-password",
+  });
+}
+
+async function recordLoginAttempt({
+  userId,
+  username,
+  success,
+  reason,
+}: {
+  userId?: string;
+  username?: string;
+  success: boolean;
+  reason?: string;
+}) {
+  await pool.query(
+    `INSERT INTO login_history (user_id, username, success, reason)
+     VALUES ($1, $2, $3, $4)`,
+    [userId ?? null, username ?? null, success, reason ?? null],
   );
 }

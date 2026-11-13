@@ -236,6 +236,33 @@ function shutdownMqtt(signal: string): void {
     });
 }
 
+export function sendDeviceCommand(command: string, payload: Record<string, unknown>) {
+  const client = globalForMqtt.fastroboxMqttClient;
+  const topic = process.env.MQTT_COMMAND_TOPIC?.trim() || "fastrobox/command";
+
+  if (!client) {
+    console.warn("[mqtt] command skipped because the broker client is not connected");
+    return { ok: false as const, reason: "mqtt-unavailable" };
+  }
+
+  const message = JSON.stringify({
+    type: "command",
+    command,
+    payload,
+    ts: new Date().toISOString(),
+  });
+
+  return new Promise<{ ok: true }>((resolve, reject) => {
+    client.publish(topic, message, { qos: 1 }, (error) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+      resolve({ ok: true });
+    });
+  });
+}
+
 export function startMqttClient(): MqttClient | undefined {
   if (globalForMqtt.fastroboxMqttClient) {
     return globalForMqtt.fastroboxMqttClient;

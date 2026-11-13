@@ -11,15 +11,21 @@ const accounts = [
     role: "TEACHER",
   },
   {
-    fullName: "Fastrobox Student",
-    username: "student",
-    email: "student@example.test",
+    fullName: "Student S1",
+    username: "student-s1",
+    email: "student-s1@example.test",
     role: "STUDENT",
   },
   {
-    fullName: "Fastrobox Guardian",
-    username: "guardian",
-    email: "guardian@example.test",
+    fullName: "Student S2",
+    username: "student-s2",
+    email: "student-s2@example.test",
+    role: "STUDENT",
+  },
+  {
+    fullName: "Guardian S1",
+    username: "guardian-s1",
+    email: "guardian-s1@example.test",
     role: "GUARDIAN",
   },
 ] as const;
@@ -74,6 +80,33 @@ async function main() {
             account.passwordHash,
             account.role,
           ],
+        );
+      }
+
+      const teacher = await client.query<{ id: string }>(
+        `SELECT id FROM users WHERE username = 'teacher' LIMIT 1`,
+      );
+      if (teacher.rowCount === 1) {
+        await client.query(
+          `INSERT INTO teacher_room_access (teacher_id, room_id)
+           VALUES ($1, 'room-01')
+           ON CONFLICT DO NOTHING`,
+          [teacher.rows[0].id],
+        );
+      }
+
+      const guardian = await client.query<{ id: string }>(
+        `SELECT id FROM users WHERE username = 'guardian-s1' LIMIT 1`,
+      );
+      const student = await client.query<{ id: string }>(
+        `SELECT id FROM users WHERE username = 'student-s1' LIMIT 1`,
+      );
+      if (guardian.rowCount === 1 && student.rowCount === 1) {
+        await client.query(
+          `INSERT INTO guardian_children (guardian_id, student_id)
+           VALUES ($1, $2)
+           ON CONFLICT DO NOTHING`,
+          [guardian.rows[0].id, student.rows[0].id],
         );
       }
 

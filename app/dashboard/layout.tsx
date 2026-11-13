@@ -2,6 +2,8 @@ import type { ReactNode } from "react";
 import { Suspense } from "react";
 import Link from "next/link";
 import { logout } from "@/app/actions/auth";
+import { EmergencyBanner } from "@/components/emergency-banner";
+import { LanguageSwitcher } from "@/components/language-switcher";
 import { requireUser } from "@/lib/authz";
 import { roleLabels } from "@/lib/roles";
 
@@ -30,7 +32,13 @@ async function AuthenticatedWorkspace({ children }: Readonly<{ children: ReactNo
           <span className="nav-mark" aria-hidden="true" />
           Overview
         </Link>
+        {user.role === "ADMIN" && (
+          <Link className="sidebar-link" href="/admin/login-history">
+            Login history
+          </Link>
+        )}
         <div className="sidebar-bottom">
+          <LanguageSwitcher initialLocale="en" />
           <div className="account-chip">
             <span className="account-initial" aria-hidden="true">
               {user.username.slice(0, 1).toUpperCase()}
@@ -45,7 +53,10 @@ async function AuthenticatedWorkspace({ children }: Readonly<{ children: ReactNo
           </form>
         </div>
       </aside>
-      <main className="workspace-main">{children}</main>
+      <main className="workspace-main">
+        <EmergencyBanner />
+        {children}
+      </main>
     </div>
   );
 }

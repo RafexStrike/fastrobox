@@ -2,8 +2,8 @@
 
 import { AuthError } from "next-auth";
 import { signIn, signOut } from "@/auth";
-import { registerUser } from "@/lib/users";
-import { isUserRole } from "@/lib/roles";
+import { authenticateUser, registerUser } from "@/lib/users";
+import { getDefaultDashboardPath, isSelfRegisterableRole, isUserRole } from "@/lib/roles";
 
 export type LoginState = { error?: string };
 type RegistrationField =
@@ -26,14 +26,19 @@ export async function login(
   const password = formData.get("password");
 
   if (typeof username !== "string" || typeof password !== "string") {
-    return { error: "The username or password is incorrect." };
+    return { error: "The username or password is incorrect, or the account is temporarily locked." };
+  }
+
+  const authenticatedUser = await authenticateUser(username, password);
+  if (!authenticatedUser) {
+    return { error: "The username or password is incorrect, or the account is temporarily locked." };
   }
 
   try {
     await signIn("credentials", {
       username,
       password,
-      redirectTo: "/dashboard",
+      redirectTo: getDefaultDashboardPath(authenticatedUser.role),
     });
   } catch (error) {
     if (error instanceof AuthError) {
@@ -60,6 +65,7 @@ export async function register(
   const confirmPassword = formData.get("confirmPassword");
   const role = formData.get("role");
   const validRole = isUserRole(role) ? role : undefined;
+  const allowedRole = validRole && isSelfRegisterableRole(validRole) ? validRole : undefined;
   const fieldErrors: RegistrationState["fieldErrors"] = {};
 
   if (typeof fullName !== "string" || !fullName.trim() || fullName.trim().length > 100) {
@@ -91,8 +97,11 @@ export async function register(
   if (!validRole) {
     fieldErrors.role = "Choose one of the available roles.";
   }
+  if (validRole && !allowedRole) {
+    fieldErrors.role = "Public registration is restricted. Please ask an administrator to create this account.";
+  }
 
-  if (Object.keys(fieldErrors).length > 0 || !validRole) {
+  if (Object.keys(fieldErrors).length > 0 || !allowedRole) {
     return { fieldErrors };
   }
 
@@ -106,7 +115,7 @@ export async function register(
       username: normalizedUsername,
       email: normalizedEmail,
       password: password as string,
-      role: validRole,
+      role: allowedRole,
     });
   } catch {
     return { error: "We couldn't create your account right now. Please try again." };
@@ -127,7 +136,7 @@ export async function register(
     await signIn("credentials", {
       username: normalizedUsername,
       password: password as string,
-      redirectTo: "/dashboard",
+      redirectTo: getDefaultDashboardPath(allowedRole),
     });
   } catch (error) {
     if (error instanceof AuthError) {
