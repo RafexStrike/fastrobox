@@ -31,6 +31,8 @@ All application code reads environment variables through `environment.ts` and th
 
 The test usernames are `admin`, `teacher`, `student`, and `guardian`; each can also be reached by its corresponding `@example.test` email. Their passwords are the values you set in the matching `SEED_*_PASSWORD` variable. The seed script will not run without the explicit confirmation variable.
 
+To create only the TEACHER, STUDENT, and GUARDIAN test accounts with generated passwords, run `npm run db:create-role-users`. It refuses to modify the database if any target username or email already exists. Save the passwords printed after creation; they are not stored in the environment or shown again.
+
 To verify lockout locally, enter a wrong password for one seeded account three times. Further attempts must fail for 60 seconds. A successful login before the third failure resets the consecutive-attempt count. The `/api/db-test` diagnostic is ADMIN-only; `/api/me` returns only the current user's id, username, and role.
 
 ## Local Checks
