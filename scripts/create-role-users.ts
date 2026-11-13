@@ -27,7 +27,7 @@ const accounts = [
 async function main() {
   loadEnvConfig(process.cwd());
 
-  const { env } = await import("../.environment");
+  const { env } = await import("../environment");
   const pool = new Pool({
     connectionString: env.POSTGRESS_SERVER,
     max: 1,

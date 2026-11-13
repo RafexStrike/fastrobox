@@ -5,7 +5,7 @@ import { Pool } from "pg";
 async function main() {
   loadEnvConfig(process.cwd());
 
-  const { env } = await import("../.environment");
+  const { env } = await import("../environment");
   if (env.SEED_CONFIRM !== "CREATE_FASTROBOX_TEST_USERS") {
     throw new Error(
       "Set SEED_CONFIRM=CREATE_FASTROBOX_TEST_USERS after verifying the target database.",
