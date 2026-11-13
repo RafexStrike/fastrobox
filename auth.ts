@@ -1,7 +1,7 @@
 import "server-only";
 import NextAuth from "next-auth";
 import Credentials from "next-auth/providers/credentials";
-import { env } from "@/.environment";
+import { env } from "@/environment";
 import { authenticateUser } from "@/lib/users";
 import { isUserRole } from "@/lib/roles";
 

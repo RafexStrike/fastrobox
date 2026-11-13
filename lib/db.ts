@@ -1,6 +1,6 @@
 import "server-only";
 import { Pool } from "pg";
-import { env } from "@/.environment";
+import { env } from "@/environment";
 
 const globalForPostgres = globalThis as typeof globalThis & {
   postgresPool?: Pool;

@@ -63,7 +63,9 @@ Before the final response, run one reporting pass. If candidates remain, from th
 ```md
 # Fastrobox Authentication
 
-This project uses Auth.js v5 Credentials authentication, PostgreSQL, and bcryptjs. There is no public registration or OAuth provider. Authentication uses an eight-hour signed JWT session in Auth.js's HttpOnly cookie. The role shown in a session is checked against the current database user before protected data is returned.
+This project uses Auth.js v5 Credentials authentication, PostgreSQL, and bcryptjs. Public registration is available for ADMIN, TEACHER, STUDENT, and GUARDIAN roles; there is no OAuth provider. Authentication uses an eight-hour signed JWT session in Auth.js's HttpOnly cookie. The role shown in a session is checked against the current database user before protected data is returned.
+
+Public ADMIN registration grants administrative access to anyone who can create an account. Disable or restrict that option through an invitation or approval workflow before using the app with real users.
 
 ## Environment
 
@@ -85,12 +87,14 @@ All application code reads environment variables through `environment.ts` and th
 
 ## Database Setup
 
-1. In the Neon SQL Editor (or with `psql` connected to the intended database), run [`db/schema.sql`](db/schema.sql). It creates the `user_role` enum, `users` table, case-insensitive unique indexes, and persistent login-lock fields. The migration is safe to rerun.
+1. In the Neon SQL Editor (or with `psql` connected to the intended database), run [`db/schema.sql`](db/schema.sql). It creates the `user_role` enum, `users` table including the full name field, case-insensitive unique indexes, and persistent login-lock fields. The migration is safe to rerun and backfills existing users' full names from their usernames.
 2. Set all four seed passwords and `SEED_CONFIRM=CREATE_FASTROBOX_TEST_USERS` in `.env.local`.
 3. Run `npm run db:seed`. It only inserts missing test accounts; it does not overwrite existing users or passwords. It prints no password or hash.
 4. Start the app with `npm run dev`, then open `http://localhost:3000/login`.
 
 The test usernames are `admin`, `teacher`, `student`, and `guardian`; each can also be reached by its corresponding `@example.test` email. Their passwords are the values you set in the matching `SEED_*_PASSWORD` variable. The seed script will not run without the explicit confirmation variable.
+
+To create only the TEACHER, STUDENT, and GUARDIAN test accounts with generated passwords, run `npm run db:create-role-users`. It refuses to modify the database if any target username or email already exists. Save the passwords printed after creation; they are not stored in the environment or shown again.
 
 To verify lockout locally, enter a wrong password for one seeded account three times. Further attempts must fail for 60 seconds. A successful login before the third failure resets the consecutive-attempt count. The `/api/db-test` diagnostic is ADMIN-only; `/api/me` returns only the current user's id, username, and role.
 
@@ -124,8 +128,21 @@ Keep database credentials and auth secrets in Vercel's encrypted environment-var
 
 import { AuthError } from "next-auth";
 import { signIn, signOut } from "@/auth";
+import { registerUser } from "@/lib/users";
+import { isUserRole } from "@/lib/roles";
 
 export type LoginState = { error?: string };
+type RegistrationField =
+  | "fullName"
+  | "username"
+  | "email"
+  | "password"
+  | "confirmPassword"
+  | "role";
+export type RegistrationState = {
+  fieldErrors?: Partial<Record<RegistrationField, string>>;
+  error?: string;
+};
 
 export async function login(
   _previousState: LoginState,
@@ -156,6 +173,98 @@ export async function login(
 
 export async function logout() {
   await signOut({ redirectTo: "/login" });
+}
+
+export async function register(
+  _previousState: RegistrationState,
+  formData: FormData,
+): Promise<RegistrationState> {
+  const fullName = formData.get("fullName");
+  const username = formData.get("username");
+  const email = formData.get("email");
+  const password = formData.get("password");
+  const confirmPassword = formData.get("confirmPassword");
+  const role = formData.get("role");
+  const validRole = isUserRole(role) ? role : undefined;
+  const fieldErrors: RegistrationState["fieldErrors"] = {};
+
+  if (typeof fullName !== "string" || !fullName.trim() || fullName.trim().length > 100) {
+    fieldErrors.fullName = "Enter your full name (up to 100 characters).";
+  }
+  if (
+    typeof username !== "string" ||
+    !/^[a-zA-Z0-9._-]{3,32}$/.test(username.trim())
+  ) {
+    fieldErrors.username = "Use 3-32 letters, numbers, dots, underscores, or hyphens.";
+  }
+  if (
+    typeof email !== "string" ||
+    email.trim().length > 254 ||
+    !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())
+  ) {
+    fieldErrors.email = "Enter a valid email address.";
+  }
+  if (
+    typeof password !== "string" ||
+    Array.from(password).length < 8 ||
+    Buffer.byteLength(password, "utf8") > 72
+  ) {
+    fieldErrors.password = "Use at least 8 characters and no more than 72 UTF-8 bytes.";
+  }
+  if (typeof confirmPassword !== "string" || confirmPassword !== password) {
+    fieldErrors.confirmPassword = "Passwords do not match.";
+  }
+  if (!validRole) {
+    fieldErrors.role = "Choose one of the available roles.";
+  }
+
+  if (Object.keys(fieldErrors).length > 0 || !validRole) {
+    return { fieldErrors };
+  }
+
+  const normalizedUsername = (username as string).trim();
+  const normalizedEmail = (email as string).trim().toLowerCase();
+  let result;
+
+  try {
+    result = await registerUser({
+      fullName: (fullName as string).trim(),
+      username: normalizedUsername,
+      email: normalizedEmail,
+      password: password as string,
+      role: validRole,
+    });
+  } catch {
+    return { error: "We couldn't create your account right now. Please try again." };
+  }
+
+  if (!result.created) {
+    const duplicateErrors: RegistrationState["fieldErrors"] = {};
+    if (result.usernameTaken) {
+      duplicateErrors.username = "That username is already registered.";
+    }
+    if (result.emailTaken) {
+      duplicateErrors.email = "That email address is already registered.";
+    }
+    return { fieldErrors: duplicateErrors };
+  }
+
+  try {
+    await signIn("credentials", {
+      username: normalizedUsername,
+      password: password as string,
+      redirectTo: "/dashboard",
+    });
+  } catch (error) {
+    if (error instanceof AuthError) {
+      return {
+        error: "Your account was created, but automatic sign-in failed. Please sign in.",
+      };
+    }
+    throw error;
+  }
+
+  return {};
 }
 ```
 
@@ -302,7 +411,7 @@ async function DashboardOverview() {
     <div className="overview-content">
       <header className="overview-heading">
         <p className="eyebrow">Your workspace</p>
-        <h1>Welcome, {user.username}.</h1>
+        <h1>Welcome, {user.fullName}.</h1>
         <p>One place to keep your learning community moving.</p>
       </header>
 
@@ -530,6 +639,74 @@ a {
   padding-top: 32px;
   color: #828a83;
   font-size: 11px;
+}
+
+.login-footnote a {
+  color: var(--forest);
+  font-weight: 650;
+  text-decoration-color: #9eb4a8;
+  text-underline-offset: 3px;
+}
+
+.signup-content .login-intro {
+  margin-top: 42px;
+}
+
+.signup-content .login-footnote {
+  padding-top: 18px;
+}
+
+.signup-form {
+  margin-top: 22px;
+}
+
+.signup-form .field-label {
+  margin-bottom: 5px;
+}
+
+.signup-form .text-input {
+  height: 42px;
+  margin-bottom: 12px;
+}
+
+.signup-form .form-error {
+  margin: -7px 0 10px;
+}
+
+.role-fieldset {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.role-options {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+.role-choice {
+  min-height: 39px;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 7px 10px;
+  border: 1px solid #d6ddd5;
+  color: #34443d;
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 620;
+}
+
+.role-choice:has(input:checked) {
+  border-color: var(--forest);
+  background: #edf2eb;
+}
+
+.role-choice input {
+  accent-color: var(--forest);
 }
 
 .login-aside {
@@ -924,6 +1101,10 @@ a {
     padding: 29px 27px 25px;
   }
 
+  .signup-content .login-intro {
+    margin-top: 40px;
+  }
+
   .login-intro {
     margin-top: 65px;
   }
@@ -1137,6 +1318,7 @@ export function LoginForm() {
 
 ```tsx
 import { LoginForm } from "@/app/login/login-form";
+import Link from "next/link";
 
 export default function LoginPage() {
   return (
@@ -1153,7 +1335,9 @@ export default function LoginPage() {
             <p className="login-subtitle">Sign in to continue to your workspace.</p>
           </div>
           <LoginForm />
-          <p className="login-footnote">Access is provided by your school or organization.</p>
+          <p className="login-footnote">
+            New to Fastrobox? <Link href="/signup">Create an account</Link>
+          </p>
         </section>
         <aside className="login-aside" aria-label="Fastrobox">
           <div className="aside-orbit" aria-hidden="true">
@@ -1179,6 +1363,205 @@ export default function LoginPage() {
 ```tsx
 export { default } from "./login/page";
 
+```
+
+
+---
+## FILE: app/signup/page.tsx
+
+```tsx
+import Link from "next/link";
+import { SignupForm } from "@/app/signup/signup-form";
+
+export default function SignupPage() {
+  return (
+    <main className="login-screen">
+      <div className="login-frame">
+        <section className="login-content signup-content" aria-labelledby="signup-title">
+          <Link className="wordmark" href="/login" aria-label="Fastrobox home">
+            <span className="wordmark-mark" aria-hidden="true">F</span>
+            <span>Fastrobox</span>
+          </Link>
+          <div className="login-intro">
+            <p className="eyebrow">Learning workspace</p>
+            <h1 id="signup-title">Create your account.</h1>
+            <p className="login-subtitle">Join your learning community.</p>
+          </div>
+          <SignupForm />
+          <p className="login-footnote">
+            Already have an account? <Link href="/login">Sign in</Link>
+          </p>
+        </section>
+        <aside className="login-aside" aria-label="Fastrobox">
+          <div className="aside-orbit" aria-hidden="true">
+            <span className="orbit-core" />
+            <span className="orbit-dot orbit-dot-one" />
+            <span className="orbit-dot orbit-dot-two" />
+          </div>
+          <p className="aside-index">01 / LEARNING, TOGETHER</p>
+          <h2>Make room for what comes next.</h2>
+          <div className="aside-rule" />
+          <p className="aside-caption">A shared space for the people who make learning matter.</p>
+        </aside>
+      </div>
+    </main>
+  );
+}
+```
+
+
+---
+## FILE: app/signup/signup-form.tsx
+
+```tsx
+"use client";
+
+import { useActionState } from "react";
+import { register, type RegistrationState } from "@/app/actions/auth";
+import { userRoles } from "@/lib/roles";
+
+const initialState: RegistrationState = {};
+
+export function SignupForm() {
+  const [state, action, pending] = useActionState(register, initialState);
+
+  return (
+    <form action={action} className="login-form signup-form">
+      <label className="field-label" htmlFor="fullName">
+        Full name
+      </label>
+      <input
+        autoComplete="name"
+        className="text-input"
+        id="fullName"
+        maxLength={100}
+        name="fullName"
+        required
+        aria-invalid={Boolean(state.fieldErrors?.fullName)}
+        aria-describedby={state.fieldErrors?.fullName ? "fullName-error" : undefined}
+      />
+      {state.fieldErrors?.fullName && (
+        <p className="form-error" id="fullName-error" role="alert">
+          {state.fieldErrors.fullName}
+        </p>
+      )}
+
+      <label className="field-label" htmlFor="username">
+        Username
+      </label>
+      <input
+        autoComplete="username"
+        autoCapitalize="none"
+        className="text-input"
+        id="username"
+        maxLength={32}
+        minLength={3}
+        name="username"
+        required
+        aria-invalid={Boolean(state.fieldErrors?.username)}
+        aria-describedby={state.fieldErrors?.username ? "username-error" : undefined}
+      />
+      {state.fieldErrors?.username && (
+        <p className="form-error" id="username-error" role="alert">
+          {state.fieldErrors.username}
+        </p>
+      )}
+
+      <label className="field-label" htmlFor="email">
+        Email
+      </label>
+      <input
+        autoComplete="email"
+        autoCapitalize="none"
+        className="text-input"
+        id="email"
+        maxLength={254}
+        name="email"
+        required
+        type="email"
+        aria-invalid={Boolean(state.fieldErrors?.email)}
+        aria-describedby={state.fieldErrors?.email ? "email-error" : undefined}
+      />
+      {state.fieldErrors?.email && (
+        <p className="form-error" id="email-error" role="alert">
+          {state.fieldErrors.email}
+        </p>
+      )}
+
+      <label className="field-label" htmlFor="password">
+        Password
+      </label>
+      <input
+        autoComplete="new-password"
+        className="text-input"
+        id="password"
+        minLength={8}
+        name="password"
+        required
+        type="password"
+        aria-invalid={Boolean(state.fieldErrors?.password)}
+        aria-describedby={state.fieldErrors?.password ? "password-error" : undefined}
+      />
+      {state.fieldErrors?.password && (
+        <p className="form-error" id="password-error" role="alert">
+          {state.fieldErrors.password}
+        </p>
+      )}
+
+      <label className="field-label" htmlFor="confirmPassword">
+        Confirm password
+      </label>
+      <input
+        autoComplete="new-password"
+        className="text-input"
+        id="confirmPassword"
+        name="confirmPassword"
+        required
+        type="password"
+        aria-invalid={Boolean(state.fieldErrors?.confirmPassword)}
+        aria-describedby={
+          state.fieldErrors?.confirmPassword ? "confirmPassword-error" : undefined
+        }
+      />
+      {state.fieldErrors?.confirmPassword && (
+        <p className="form-error" id="confirmPassword-error" role="alert">
+          {state.fieldErrors.confirmPassword}
+        </p>
+      )}
+
+      <fieldset
+        className="role-fieldset"
+        aria-invalid={Boolean(state.fieldErrors?.role)}
+        aria-describedby={state.fieldErrors?.role ? "role-error" : undefined}
+      >
+        <legend className="field-label">Role</legend>
+        <div className="role-options">
+          {userRoles.map((role) => (
+            <label className="role-choice" key={role}>
+              <input name="role" required type="radio" value={role} />
+              <span>{role}</span>
+            </label>
+          ))}
+        </div>
+      </fieldset>
+      {state.fieldErrors?.role && (
+        <p className="form-error" id="role-error" role="alert">
+          {state.fieldErrors.role}
+        </p>
+      )}
+
+      {state.error && (
+        <p className="form-error" role="alert">
+          {state.error}
+        </p>
+      )}
+
+      <button className="submit-button" disabled={pending} type="submit">
+        {pending ? "Creating account..." : "Create account"}
+      </button>
+    </form>
+  );
+}
 ```
 
 
@@ -1393,7 +1776,7 @@ export const roleDescriptions: Record<UserRole, string> = {
 
 ```ts
 import "server-only";
-import { compare } from "bcryptjs";
+import { compare, hash } from "bcryptjs";
 import { pool } from "@/lib/db";
 import type { UserRole } from "@/lib/roles";
 
@@ -1408,8 +1791,69 @@ type LoginRow = {
 export type AuthenticatedUser = {
   id: string;
   username: string;
+  fullName: string;
   role: UserRole;
 };
+
+export type RegistrationInput = {
+  fullName: string;
+  username: string;
+  email: string;
+  password: string;
+  role: UserRole;
+};
+
+export type RegistrationResult =
+  | { created: true }
+  | { created: false; usernameTaken: boolean; emailTaken: boolean };
+
+export async function registerUser(
+  input: RegistrationInput,
+): Promise<RegistrationResult> {
+  const existing = await pool.query<{
+    username_taken: boolean;
+    email_taken: boolean;
+  }>(
+    `SELECT EXISTS (
+              SELECT 1 FROM users WHERE lower(username) = lower($1)
+            ) AS username_taken,
+            EXISTS (
+              SELECT 1 FROM users WHERE lower(email) = lower($2)
+            ) AS email_taken`,
+    [input.username, input.email],
+  );
+  const duplicate = existing.rows[0];
+
+  if (duplicate.username_taken || duplicate.email_taken) {
+    return {
+      created: false,
+      usernameTaken: duplicate.username_taken,
+      emailTaken: duplicate.email_taken,
+    };
+  }
+
+  const passwordHash = await hash(input.password, 12);
+
+  try {
+    await pool.query(
+      `INSERT INTO users (full_name, username, email, password_hash, role)
+       VALUES ($1, $2, $3, $4, $5::user_role)`,
+      [input.fullName, input.username, input.email, passwordHash, input.role],
+    );
+  } catch (error) {
+    if (isUniqueViolation(error)) {
+      if (error.constraint === "users_username_lower_unique") {
+        return { created: false, usernameTaken: true, emailTaken: false };
+      }
+      if (error.constraint === "users_email_lower_unique") {
+        return { created: false, usernameTaken: false, emailTaken: true };
+      }
+    }
+    throw error;
+  }
+
+  return { created: true };
+}
 
 export async function authenticateUser(
   identifier: string,
@@ -1458,13 +1902,24 @@ export async function authenticateUser(
 
 export async function findUserById(id: string): Promise<AuthenticatedUser | null> {
   const result = await pool.query<AuthenticatedUser>(
-    `SELECT id, username, role
+    `SELECT id, username, full_name AS "fullName", role
        FROM users
       WHERE id = $1`,
     [id],
   );
 
   return result.rows[0] ?? null;
+}
+
+function isUniqueViolation(
+  error: unknown,
+): error is { code: string; constraint?: string } {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    error.code === "23505"
+  );
 }
 
 async function recordFailedLogin(id: string) {
@@ -9148,7 +9603,8 @@ export default nextConfig;
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "db:seed": "tsx scripts/seed-users.ts"
+    "db:seed": "tsx scripts/seed-users.ts",
+    "db:create-role-users": "tsx scripts/create-role-users.ts"
   },
   "dependencies": {
     "bcryptjs": "^3.0.3",
@@ -9217,6 +9673,122 @@ export const config = {
 
 
 ---
+## FILE: scripts/create-role-users.ts
+
+```ts
+import { randomBytes } from "node:crypto";
+import { loadEnvConfig } from "@next/env";
+import { hash } from "bcryptjs";
+import { Pool } from "pg";
+
+const accounts = [
+  {
+    fullName: "Fastrobox Teacher",
+    username: "teacher",
+    email: "teacher@example.test",
+    role: "TEACHER",
+  },
+  {
+    fullName: "Fastrobox Student",
+    username: "student",
+    email: "student@example.test",
+    role: "STUDENT",
+  },
+  {
+    fullName: "Fastrobox Guardian",
+    username: "guardian",
+    email: "guardian@example.test",
+    role: "GUARDIAN",
+  },
+] as const;
+
+async function main() {
+  loadEnvConfig(process.cwd());
+
+  const { env } = await import("../.environment");
+  const pool = new Pool({
+    connectionString: env.POSTGRESS_SERVER,
+    max: 1,
+    connectionTimeoutMillis: 5_000,
+  });
+
+  try {
+    const client = await pool.connect();
+    const generatedAccounts = await Promise.all(
+      accounts.map(async (account) => {
+        const password = randomBytes(24).toString("base64url");
+        return { ...account, password, passwordHash: await hash(password, 12) };
+      }),
+    );
+
+    try {
+      await client.query("BEGIN");
+      const existing = await client.query(
+        `SELECT EXISTS (
+           SELECT 1 FROM users
+            WHERE lower(username) = ANY($1::text[])
+               OR lower(email) = ANY($2::text[])
+         ) AS conflict`,
+        [
+          accounts.map((account) => account.username),
+          accounts.map((account) => account.email),
+        ],
+      );
+
+      if (existing.rows[0].conflict) {
+        throw new Error(
+          "A target username or email already exists. No accounts were changed.",
+        );
+      }
+
+      for (const account of generatedAccounts) {
+        await client.query(
+          `INSERT INTO users (full_name, username, email, password_hash, role)
+           VALUES ($1, $2, $3, $4, $5::user_role)`,
+          [
+            account.fullName,
+            account.username,
+            account.email,
+            account.passwordHash,
+            account.role,
+          ],
+        );
+      }
+
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+
+    console.info(
+      "Created these accounts. Save the generated passwords; they will not be shown again:\n" +
+        JSON.stringify(
+          generatedAccounts.map(({ username, email, role, password }) => ({
+            username,
+            email,
+            role,
+            password,
+          })),
+          null,
+          2,
+        ),
+    );
+  } finally {
+    await pool.end();
+  }
+}
+
+void main().catch((error: unknown) => {
+  console.error(error instanceof Error ? error.message : "Account creation failed.");
+  process.exitCode = 1;
+});
+```
+
+
+---
 ## FILE: scripts/seed-users.ts
 
 ```ts
@@ -9236,24 +9808,28 @@ async function main() {
 
   const accounts = [
     {
+      fullName: "Fastrobox Admin",
       username: "admin",
       email: "admin@example.test",
       role: "ADMIN",
       password: env.SEED_ADMIN_PASSWORD,
     },
     {
+      fullName: "Fastrobox Teacher",
       username: "teacher",
       email: "teacher@example.test",
       role: "TEACHER",
       password: env.SEED_TEACHER_PASSWORD,
     },
     {
+      fullName: "Fastrobox Student",
       username: "student",
       email: "student@example.test",
       role: "STUDENT",
       password: env.SEED_STUDENT_PASSWORD,
     },
     {
+      fullName: "Fastrobox Guardian",
       username: "guardian",
       email: "guardian@example.test",
       role: "GUARDIAN",
@@ -9284,11 +9860,11 @@ async function main() {
       }
       const passwordHash = await hash(password, 12);
       const result = await pool.query(
-        `INSERT INTO users (username, email, password_hash, role)
-         VALUES ($1, $2, $3, $4::user_role)
+        `INSERT INTO users (full_name, username, email, password_hash, role)
+         VALUES ($1, $2, $3, $4, $5::user_role)
          ON CONFLICT DO NOTHING
          RETURNING id`,
-        [account.username, account.email, passwordHash, account.role],
+        [account.fullName, account.username, account.email, passwordHash, account.role],
       );
 
       console.info(
