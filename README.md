@@ -12,6 +12,11 @@ Copy `.env.example` to `.env.local` (or update your existing ignored `.env`) and
 | --- | --- | --- |
 | `POSTGRESS_SERVER` | Yes | Neon/PostgreSQL connection URL. The existing spelling is intentional. |
 | `AUTH_SECRET` | Yes | Random secret of at least 32 characters for Auth.js sessions. |
+| `MQTT_HOST` | No | MQTT TLS broker host; defaults to `broker.emqx.io`. |
+| `MQTT_PORT` | No | MQTT TLS port; defaults to `8883`. |
+| `MQTT_USERNAME` | No | Optional MQTT username. |
+| `MQTT_PASSWORD` | No | Optional MQTT password. |
+| `MQTT_TOPIC` | No | Topic to subscribe to; defaults to `buddhi-kom-sensor-beshi`. |
 | `SEED_ADMIN_PASSWORD` | Seed only | Initial ADMIN test user's password. |
 | `SEED_TEACHER_PASSWORD` | Seed only | Initial TEACHER test user's password. |
 | `SEED_STUDENT_PASSWORD` | Seed only | Initial STUDENT test user's password. |
@@ -20,7 +25,13 @@ Copy `.env.example` to `.env.local` (or update your existing ignored `.env`) and
 
 Generate a session secret with `openssl rand -base64 32`. Choose four different test passwords with at least 12 characters. The seed command accepts only password values from environment variables and stores bcrypt hashes; do not put real user passwords in source control. The local environment loader temporarily accepts the previous `BETTER_AUTH_SECRET` key as a migration fallback, but new deployments should set `AUTH_SECRET`.
 
-All application code reads environment variables through `environment.ts` and the `.environment.ts` re-export. Those modules are server-only by usage; never add a `NEXT_PUBLIC_` prefix to these values.
+Application configuration is server-only; never add a `NEXT_PUBLIC_` prefix to these values. The MQTT subscriber reads its optional settings directly from the Node.js process environment.
+
+## MQTT
+
+The root `instrumentation.ts` starts one MQTT subscriber in the Node.js runtime. It uses TLS certificate verification, reconnects automatically, subscribes after connecting, and logs valid JSON messages while ignoring malformed JSON safely. Set the MQTT variables above in Render's environment settings; connection, subscription, reconnect, and message status appear in the service logs. MQTT credentials are never logged.
+
+Apply `db/schema.sql` before enabling ingestion. It adds `sensor_messages` and `mqtt_devices` without changing the existing user tables. Telemetry and event payloads are validated against their respective rulebook field names, retained as JSONB, and stored with a unique `(device_id, seq)` constraint. The subscriber stores device events using `device_id`, `room_id`, `seq`, `ts`, `type`, and `detail`; telemetry fields use the specified camelCase names. Devices are marked offline after 25 seconds without a valid message and online again when a message arrives.
 
 ## Database Setup
 

@@ -75,6 +75,11 @@ Copy `.env.example` to `.env.local` (or update your existing ignored `.env`) and
 | --- | --- | --- |
 | `POSTGRESS_SERVER` | Yes | Neon/PostgreSQL connection URL. The existing spelling is intentional. |
 | `AUTH_SECRET` | Yes | Random secret of at least 32 characters for Auth.js sessions. |
+| `MQTT_HOST` | No | MQTT TLS broker host; defaults to `broker.emqx.io`. |
+| `MQTT_PORT` | No | MQTT TLS port; defaults to `8883`. |
+| `MQTT_USERNAME` | No | Optional MQTT username. |
+| `MQTT_PASSWORD` | No | Optional MQTT password. |
+| `MQTT_TOPIC` | No | Topic to subscribe to; defaults to `buddhi-kom-sensor-beshi`. |
 | `SEED_ADMIN_PASSWORD` | Seed only | Initial ADMIN test user's password. |
 | `SEED_TEACHER_PASSWORD` | Seed only | Initial TEACHER test user's password. |
 | `SEED_STUDENT_PASSWORD` | Seed only | Initial STUDENT test user's password. |
@@ -83,7 +88,13 @@ Copy `.env.example` to `.env.local` (or update your existing ignored `.env`) and
 
 Generate a session secret with `openssl rand -base64 32`. Choose four different test passwords with at least 12 characters. The seed command accepts only password values from environment variables and stores bcrypt hashes; do not put real user passwords in source control. The local environment loader temporarily accepts the previous `BETTER_AUTH_SECRET` key as a migration fallback, but new deployments should set `AUTH_SECRET`.
 
-All application code reads environment variables through `environment.ts` and the `.environment.ts` re-export. Those modules are server-only by usage; never add a `NEXT_PUBLIC_` prefix to these values.
+Application configuration is server-only; never add a `NEXT_PUBLIC_` prefix to these values. The MQTT subscriber reads its optional settings directly from the Node.js process environment.
+
+## MQTT
+
+The root `instrumentation.ts` starts one MQTT subscriber in the Node.js runtime. It uses TLS certificate verification, reconnects automatically, subscribes after connecting, and logs valid JSON messages while ignoring malformed JSON safely. Set the MQTT variables above in Render's environment settings; connection, subscription, reconnect, and message status appear in the service logs. MQTT credentials are never logged.
+
+Apply `db/schema.sql` before enabling ingestion. It adds `sensor_messages` and `mqtt_devices` without changing the existing user tables. Telemetry and event payloads are validated against their respective rulebook field names, retained as JSONB, and stored with a unique `(device_id, seq)` constraint. The subscriber stores device events using `device_id`, `room_id`, `seq`, `ts`, `type`, and `detail`; telemetry fields use the specified camelCase names. Devices are marked offline after 25 seconds without a valid message and online again when a message arrives.
 
 ## Database Setup
 
@@ -1572,7 +1583,7 @@ export function SignupForm() {
 import "server-only";
 import NextAuth from "next-auth";
 import Credentials from "next-auth/providers/credentials";
-import { env } from "@/.environment";
+import { env } from "@/environment";
 import { authenticateUser } from "@/lib/users";
 import { isUserRole } from "@/lib/roles";
 
@@ -1672,6 +1683,19 @@ export type AppEnvironment = typeof env;
 
 
 ---
+## FILE: instrumentation.ts
+
+```ts
+export async function register() {
+  if (process.env.NEXT_RUNTIME === "nodejs") {
+    const { startMqttClient } = await import("@/lib/mqtt/client");
+    startMqttClient();
+  }
+}
+```
+
+
+---
 ## FILE: lib/authz.ts
 
 ```ts
@@ -1722,7 +1746,7 @@ export async function authorizeRoles(...roles: UserRole[]) {
 ```ts
 import "server-only";
 import { Pool } from "pg";
-import { env } from "@/.environment";
+import { env } from "@/environment";
 
 const globalForPostgres = globalThis as typeof globalThis & {
   postgresPool?: Pool;
@@ -1739,6 +1763,358 @@ export const pool =
 
 if (env.NODE_ENV !== "production") {
   globalForPostgres.postgresPool = pool;
+}
+```
+
+
+---
+## FILE: lib/mqtt/client.ts
+
+```ts
+import "server-only";
+import mqtt, { type MqttClient } from "mqtt";
+import { pool } from "@/lib/db";
+
+type JsonRecord = Record<string, unknown>;
+
+type Telemetry = {
+  uptimeS: number;
+  tempC: number;
+  rh: number;
+  heatIndexC: number;
+  flame: boolean;
+  door: string;
+  status: string;
+  heatTrend: string;
+  rssi: number;
+  heapKb: number;
+  chipTempC: number;
+  fw: string;
+  quality: string;
+};
+
+type NormalizedMessage = {
+  deviceId: string;
+  roomId: string;
+  seq: number;
+  timestamp: string;
+  payload: JsonRecord;
+} & (
+  | { kind: "telemetry"; telemetry: Telemetry }
+  | { kind: "event"; eventType: string; detail: unknown }
+);
+
+const globalForMqtt = globalThis as typeof globalThis & {
+  fastroboxMqttClient?: MqttClient;
+  fastroboxMqttOfflineTimer?: NodeJS.Timeout;
+};
+
+function errorCode(error: unknown): string | undefined {
+  if (typeof error === "object" && error !== null && "code" in error) {
+    return String(error.code);
+  }
+  return undefined;
+}
+
+function isRecord(value: unknown): value is JsonRecord {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function isText(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+
+function parseTimestamp(value: unknown): string | undefined {
+  const date =
+    typeof value === "number"
+      ? new Date(value * 1_000)
+      : typeof value === "string"
+        ? new Date(value)
+        : undefined;
+  return date && Number.isFinite(date.getTime()) ? date.toISOString() : undefined;
+}
+
+function normalizeMessage(value: unknown): NormalizedMessage | undefined {
+  if (!isRecord(value)) return undefined;
+
+  if (
+    isText(value.deviceId) &&
+    isText(value.roomId) &&
+    Number.isSafeInteger(value.seq) &&
+    Number(value.seq) >= 0
+  ) {
+    const timestamp = parseTimestamp(value.ts);
+    const telemetry: Telemetry = {
+      uptimeS: value.uptimeS as number,
+      tempC: value.tempC as number,
+      rh: value.rh as number,
+      heatIndexC: value.heatIndexC as number,
+      flame: value.flame as boolean,
+      door: value.door as string,
+      status: value.status as string,
+      heatTrend: value.heatTrend as string,
+      rssi: value.rssi as number,
+      heapKb: value.heapKb as number,
+      chipTempC: value.chipTempC as number,
+      fw: value.fw as string,
+      quality: value.quality as string,
+    };
+    const validTelemetry =
+      timestamp !== undefined &&
+      Number.isSafeInteger(telemetry.uptimeS) &&
+      isFiniteNumber(telemetry.tempC) &&
+      isFiniteNumber(telemetry.rh) &&
+      isFiniteNumber(telemetry.heatIndexC) &&
+      typeof telemetry.flame === "boolean" &&
+      isText(telemetry.door) &&
+      isText(telemetry.status) &&
+      isText(telemetry.heatTrend) &&
+      Number.isInteger(telemetry.rssi) &&
+      isFiniteNumber(telemetry.heapKb) &&
+      isFiniteNumber(telemetry.chipTempC) &&
+      isText(telemetry.fw) &&
+      isText(telemetry.quality);
+
+    if (!validTelemetry) return undefined;
+    return {
+      kind: "telemetry",
+      deviceId: value.deviceId,
+      roomId: value.roomId,
+      seq: Number(value.seq),
+      timestamp,
+      telemetry,
+      payload: value,
+    };
+  }
+
+  if (
+    isText(value.device_id) &&
+    isText(value.room_id) &&
+    Number.isSafeInteger(value.seq) &&
+    Number(value.seq) >= 0 &&
+    isText(value.type) &&
+    Object.hasOwn(value, "detail")
+  ) {
+    const timestamp = parseTimestamp(value.ts);
+    if (!timestamp) return undefined;
+    return {
+      kind: "event",
+      deviceId: value.device_id,
+      roomId: value.room_id,
+      seq: Number(value.seq),
+      timestamp,
+      eventType: value.type,
+      detail: value.detail,
+      payload: value,
+    };
+  }
+
+  return undefined;
+}
+
+async function persistMessage(message: NormalizedMessage): Promise<boolean> {
+  const connection = await pool.connect();
+  try {
+    await connection.query("BEGIN");
+    const telemetry = message.kind === "telemetry" ? message.telemetry : undefined;
+    const eventType = message.kind === "event" ? message.eventType : null;
+    const detail = message.kind === "event" ? JSON.stringify(message.detail) : null;
+    const inserted = await connection.query(
+      `INSERT INTO sensor_messages (
+         device_id, room_id, seq, message_kind, message_ts, event_type, detail,
+         uptime_s, temp_c, rh, heat_index_c, flame, door, status, heat_trend,
+         rssi, heap_kb, chip_temp_c, fw, quality, payload
+       ) VALUES (
+         $1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11, $12, $13, $14,
+         $15, $16, $17, $18, $19, $20, $21::jsonb
+       )
+       ON CONFLICT (device_id, seq) DO NOTHING`,
+      [
+        message.deviceId,
+        message.roomId,
+        message.seq,
+        message.kind,
+        message.timestamp,
+        eventType,
+        detail,
+        telemetry?.uptimeS ?? null,
+        telemetry?.tempC ?? null,
+        telemetry?.rh ?? null,
+        telemetry?.heatIndexC ?? null,
+        telemetry?.flame ?? null,
+        telemetry?.door ?? null,
+        telemetry?.status ?? null,
+        telemetry?.heatTrend ?? null,
+        telemetry?.rssi ?? null,
+        telemetry?.heapKb ?? null,
+        telemetry?.chipTempC ?? null,
+        telemetry?.fw ?? null,
+        telemetry?.quality ?? null,
+        JSON.stringify(message.payload),
+      ],
+    );
+
+    await connection.query(
+      `INSERT INTO mqtt_devices (device_id, room_id, last_seen_at, is_online)
+       VALUES ($1, $2, clock_timestamp(), true)
+       ON CONFLICT (device_id) DO UPDATE
+         SET room_id = EXCLUDED.room_id,
+             last_seen_at = EXCLUDED.last_seen_at,
+             is_online = true`,
+      [message.deviceId, message.roomId],
+    );
+    await connection.query("COMMIT");
+    return inserted.rowCount === 1;
+  } catch (error) {
+    await connection.query("ROLLBACK").catch(() => undefined);
+    throw error;
+  } finally {
+    connection.release();
+  }
+}
+
+async function markStaleDevicesOffline(): Promise<void> {
+  try {
+    const result = await pool.query(
+      `UPDATE mqtt_devices
+          SET is_online = false
+        WHERE is_online
+          AND last_seen_at < clock_timestamp() - interval '25 seconds'`,
+    );
+    if (result.rowCount) {
+      console.info(`[mqtt] marked ${result.rowCount} device(s) offline`);
+    }
+  } catch (error) {
+    console.error("[mqtt] offline status update failed", { code: errorCode(error) });
+  }
+}
+
+function shutdownMqtt(signal: string): void {
+  const client = globalForMqtt.fastroboxMqttClient;
+  if (!client) return;
+
+  if (globalForMqtt.fastroboxMqttOfflineTimer) {
+    clearInterval(globalForMqtt.fastroboxMqttOfflineTimer);
+  }
+  console.info(`[mqtt] graceful shutdown requested (${signal})`);
+  void client
+    .endAsync(false)
+    .then(() => console.info("[mqtt] connection closed"))
+    .catch((error: unknown) => {
+      console.error("[mqtt] graceful shutdown failed", { code: errorCode(error) });
+    });
+}
+
+export function startMqttClient(): MqttClient | undefined {
+  if (globalForMqtt.fastroboxMqttClient) {
+    return globalForMqtt.fastroboxMqttClient;
+  }
+
+  const host = process.env.MQTT_HOST?.trim() || "broker.emqx.io";
+  const port = Number(process.env.MQTT_PORT?.trim() || "8883");
+  const topic = process.env.MQTT_TOPIC?.trim() || "buddhi-kom-sensor-beshi";
+
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    console.error("[mqtt] invalid MQTT_PORT; subscriber not started");
+    return undefined;
+  }
+
+  const username = process.env.MQTT_USERNAME?.trim();
+  const password = process.env.MQTT_PASSWORD;
+  const client = mqtt.connect(`mqtts://${host}:${port}`, {
+    rejectUnauthorized: true,
+    reconnectPeriod: 5_000,
+    connectTimeout: 30_000,
+    clean: true,
+    ...(username ? { username } : {}),
+    ...(password ? { password } : {}),
+  });
+
+  globalForMqtt.fastroboxMqttClient = client;
+
+  client.on("connect", () => {
+    console.info(`[mqtt] connected to ${host}:${port}`);
+    client.subscribe(topic, { qos: 1 }, (error) => {
+      if (error) {
+        console.error("[mqtt] subscription failed", {
+          topic,
+          code: errorCode(error),
+        });
+        return;
+      }
+      console.info(`[mqtt] subscribed to ${topic}`);
+    });
+  });
+
+  client.on("reconnect", () => console.info("[mqtt] reconnecting"));
+  client.on("offline", () => console.warn("[mqtt] broker connection is offline"));
+  client.on("close", () => console.warn("[mqtt] broker connection closed"));
+  client.on("error", (error) => {
+    console.error("[mqtt] connection error", { code: errorCode(error) });
+  });
+
+  client.on("message", (messageTopic, payload) => {
+    let payloadJson: unknown;
+    try {
+      payloadJson = JSON.parse(payload.toString("utf8"));
+    } catch {
+      console.warn("[mqtt] malformed JSON message", {
+        topic: messageTopic,
+        bytes: payload.byteLength,
+      });
+      return;
+    }
+
+    console.info("[mqtt] JSON message received", {
+      topic: messageTopic,
+      payload: payloadJson,
+    });
+    const message = normalizeMessage(payloadJson);
+    if (!message) {
+      console.warn("[mqtt] JSON message does not match telemetry or event format", {
+        topic: messageTopic,
+      });
+      return;
+    }
+
+    void persistMessage(message)
+      .then((inserted) => {
+        if (inserted) {
+          console.info("[mqtt] message stored", {
+            deviceId: message.deviceId,
+            seq: message.seq,
+            kind: message.kind,
+            ...(message.kind === "event" ? { type: message.eventType } : {}),
+          });
+        } else {
+          console.info("[mqtt] replayed sequence ignored", {
+            deviceId: message.deviceId,
+            seq: message.seq,
+          });
+        }
+      })
+      .catch((error: unknown) => {
+        console.error("[mqtt] database persistence failed", {
+          code: errorCode(error),
+        });
+      });
+  });
+
+  void markStaleDevicesOffline();
+  globalForMqtt.fastroboxMqttOfflineTimer = setInterval(() => {
+    void markStaleDevicesOffline();
+  }, 5_000);
+  globalForMqtt.fastroboxMqttOfflineTimer.unref();
+
+  process.once("SIGTERM", () => shutdownMqtt("SIGTERM"));
+  process.once("SIGINT", () => shutdownMqtt("SIGINT"));
+
+  console.info(`[mqtt] connecting to ${host}:${port}`);
+  return client;
 }
 ```
 
@@ -1964,8 +2340,8 @@ async function recordFailedLogin(id: string) {
 ```ts
 /// <reference types="next" />
 /// <reference types="next/image-types/global" />
-import "./.next/dev/types/routes.d.ts";
-import "./.next/dev/types/root-params.d.ts";
+import "./.next/types/routes.d.ts";
+import "./.next/types/root-params.d.ts";
 
 // NOTE: This file should not be edited
 // see https://nextjs.org/docs/app/api-reference/config/typescript for more information.
@@ -2019,6 +2395,7 @@ export default nextConfig;
       "version": "0.1.0",
       "dependencies": {
         "bcryptjs": "^3.0.3",
+        "mqtt": "^5.16.1",
         "next": "16.4.6",
         "next-auth": "^5.0.0-beta.32",
         "pg": "^8.23.1",
@@ -2271,6 +2648,15 @@ export default nextConfig;
       },
       "engines": {
         "node": ">=6.0.0"
+      }
+    },
+    "node_modules/@babel/runtime": {
+      "version": "7.29.14",
+      "resolved": "https://registry.npmjs.org/@babel/runtime/-/runtime-7.29.14.tgz",
+      "integrity": "sha512-Y5tqevQaUAZhhj82BpYMNC1ssvLQTVAfwKdm8iy8qwmhvC2/CpcAu8OC+QEtjM7pMk7knx83u1Qj8gzkicyelw==",
+      "license": "MIT",
+      "engines": {
+        "node": ">=6.9.0"
       }
     },
     "node_modules/@babel/template": {
@@ -4158,7 +4544,6 @@ export default nextConfig;
       "version": "20.19.43",
       "resolved": "https://registry.npmjs.org/@types/node/-/node-20.19.43.tgz",
       "integrity": "sha512-6oYBAi5ikg4Pl+kGsoYtawUMBT2zZMCvPNF7pVLnHZfd1zf38DRiWn/gT01RYCdUqkv7Fhr+C9ot4/tb+2sVvA==",
-      "dev": true,
       "license": "MIT",
       "dependencies": {
         "undici-types": "~6.21.0"
@@ -4194,6 +4579,24 @@ export default nextConfig;
       "license": "MIT",
       "peerDependencies": {
         "@types/react": "^19.3.0"
+      }
+    },
+    "node_modules/@types/readable-stream": {
+      "version": "4.0.25",
+      "resolved": "https://registry.npmjs.org/@types/readable-stream/-/readable-stream-4.0.25.tgz",
+      "integrity": "sha512-7GsxL8Wd5X3jh73/qgW7WCnbBvGSdD8U3E4Jiuus3/8I+PN20DtlkJtwFhr/sImXfDDQ2Z03i/9wNiIF3TVSsw==",
+      "license": "MIT",
+      "dependencies": {
+        "@types/node": "*"
+      }
+    },
+    "node_modules/@types/ws": {
+      "version": "8.18.2",
+      "resolved": "https://registry.npmjs.org/@types/ws/-/ws-8.18.2.tgz",
+      "integrity": "sha512-67MQl+fpWKVTT1NYdnmo3U4sc/xPo/zQBncVnI74qmQa0z/b+1g6iYqNmGCPbxO+zz2aklb08a0oHfegiVd0/w==",
+      "license": "MIT",
+      "dependencies": {
+        "@types/node": "*"
       }
     },
     "node_modules/@typescript-eslint/eslint-plugin": {
@@ -4815,6 +5218,18 @@ export default nextConfig;
         "win32"
       ]
     },
+    "node_modules/abort-controller": {
+      "version": "3.0.0",
+      "resolved": "https://registry.npmjs.org/abort-controller/-/abort-controller-3.0.0.tgz",
+      "integrity": "sha512-h8lQ8tacZYnR3vNQTgibj+tODHI5/+l06Au2Pcriv/Gmet0eaj4TwWH41sO9wnHDiQsEj19q0drzdWdeAHtweg==",
+      "license": "MIT",
+      "dependencies": {
+        "event-target-shim": "^5.0.0"
+      },
+      "engines": {
+        "node": ">=6.5"
+      }
+    },
     "node_modules/acorn": {
       "version": "8.19.0",
       "resolved": "https://registry.npmjs.org/acorn/-/acorn-8.19.0.tgz",
@@ -5108,6 +5523,26 @@ export default nextConfig;
       "dev": true,
       "license": "MIT"
     },
+    "node_modules/base64-js": {
+      "version": "1.5.1",
+      "resolved": "https://registry.npmjs.org/base64-js/-/base64-js-1.5.1.tgz",
+      "integrity": "sha512-AKpaYlHn8t4SVbOHCy+b5+KKgvR4vrsD8vbvrbiQJps7fKDTkjkDry6ji0rUJjC0kzbNePLwzxq8iypo41qeWA==",
+      "funding": [
+        {
+          "type": "github",
+          "url": "https://github.com/sponsors/feross"
+        },
+        {
+          "type": "patreon",
+          "url": "https://www.patreon.com/feross"
+        },
+        {
+          "type": "consulting",
+          "url": "https://feross.org/support"
+        }
+      ],
+      "license": "MIT"
+    },
     "node_modules/baseline-browser-mapping": {
       "version": "2.11.36",
       "resolved": "https://registry.npmjs.org/baseline-browser-mapping/-/baseline-browser-mapping-2.11.36.tgz",
@@ -5127,6 +5562,18 @@ export default nextConfig;
       "license": "BSD-3-Clause",
       "bin": {
         "bcrypt": "bin/bcrypt"
+      }
+    },
+    "node_modules/bl": {
+      "version": "6.1.6",
+      "resolved": "https://registry.npmjs.org/bl/-/bl-6.1.6.tgz",
+      "integrity": "sha512-jLsPgN/YSvPUg9UX0Kd73CXpm2Psg9FxMeCSXnk3WBO3CMT10JMwijubhGfHCnFu6TPn1ei3b975dxv7K2pWVg==",
+      "license": "MIT",
+      "dependencies": {
+        "@types/readable-stream": "^4.0.0",
+        "buffer": "^6.0.3",
+        "inherits": "^2.0.4",
+        "readable-stream": "^4.2.0"
       }
     },
     "node_modules/brace-expansion": {
@@ -5151,6 +5598,18 @@ export default nextConfig;
       },
       "engines": {
         "node": ">=8"
+      }
+    },
+    "node_modules/broker-factory": {
+      "version": "3.1.15",
+      "resolved": "https://registry.npmjs.org/broker-factory/-/broker-factory-3.1.15.tgz",
+      "integrity": "sha512-ko+aWvgNuP49meGrdjUu7rC+Y+Wai3cCPxP3xWwHsHfehFjOh5ZQM2yC4gEB2UddeZ/YXhm0K1eG/L6fxym2Og==",
+      "license": "MIT",
+      "dependencies": {
+        "@babel/runtime": "^7.29.7",
+        "fast-unique-numbers": "^9.0.27",
+        "tslib": "^2.8.1",
+        "worker-factory": "^7.0.50"
       }
     },
     "node_modules/browserslist": {
@@ -5186,6 +5645,36 @@ export default nextConfig;
       "engines": {
         "node": "^6 || ^7 || ^8 || ^9 || ^10 || ^11 || ^12 || >=13.7"
       }
+    },
+    "node_modules/buffer": {
+      "version": "6.0.3",
+      "resolved": "https://registry.npmjs.org/buffer/-/buffer-6.0.3.tgz",
+      "integrity": "sha512-FTiCpNxtwiZZHEZbcbTIcZjERVICn9yq/pDFkTl95/AxzD1naBctN7YO68riM/gLSDY7sdrMby8hofADYuuqOA==",
+      "funding": [
+        {
+          "type": "github",
+          "url": "https://github.com/sponsors/feross"
+        },
+        {
+          "type": "patreon",
+          "url": "https://www.patreon.com/feross"
+        },
+        {
+          "type": "consulting",
+          "url": "https://feross.org/support"
+        }
+      ],
+      "license": "MIT",
+      "dependencies": {
+        "base64-js": "^1.3.1",
+        "ieee754": "^1.2.1"
+      }
+    },
+    "node_modules/buffer-from": {
+      "version": "1.1.2",
+      "resolved": "https://registry.npmjs.org/buffer-from/-/buffer-from-1.1.2.tgz",
+      "integrity": "sha512-E+XQCRwSbaaiChtv6k6Dwgc+bx+Bs6vuKJHHl5kox/BaKbhiXzqQOwK4cO22yElGp2OCmjwVhT3HmxgyPGnJfQ==",
+      "license": "MIT"
     },
     "node_modules/call-bind": {
       "version": "1.0.9",
@@ -5310,12 +5799,47 @@ export default nextConfig;
       "dev": true,
       "license": "MIT"
     },
+    "node_modules/commist": {
+      "version": "3.2.0",
+      "resolved": "https://registry.npmjs.org/commist/-/commist-3.2.0.tgz",
+      "integrity": "sha512-4PIMoPniho+LqXmpS5d3NuGYncG6XWlkBSVGiWycL22dd42OYdUGil2CWuzklaJoNxyxUSpO4MKIBU94viWNAw==",
+      "license": "MIT"
+    },
     "node_modules/concat-map": {
       "version": "0.0.1",
       "resolved": "https://registry.npmjs.org/concat-map/-/concat-map-0.0.1.tgz",
       "integrity": "sha512-/Srv4dswyQNBfohGpz9o6Yb3Gz3SrUDqBH5rTuhGR7ahtlbYKnVxw2bCFMRljaA7EXHaXZ8wsHdodFvbkhKmqg==",
       "dev": true,
       "license": "MIT"
+    },
+    "node_modules/concat-stream": {
+      "version": "2.0.0",
+      "resolved": "https://registry.npmjs.org/concat-stream/-/concat-stream-2.0.0.tgz",
+      "integrity": "sha512-MWufYdFw53ccGjCA+Ol7XJYpAlW6/prSMzuPOTRnJGcGzuhLn4Scrz7qf6o8bROZ514ltazcIFJZevcfbo0x7A==",
+      "engines": [
+        "node >= 6.0"
+      ],
+      "license": "MIT",
+      "dependencies": {
+        "buffer-from": "^1.0.0",
+        "inherits": "^2.0.3",
+        "readable-stream": "^3.0.2",
+        "typedarray": "^0.0.6"
+      }
+    },
+    "node_modules/concat-stream/node_modules/readable-stream": {
+      "version": "3.6.2",
+      "resolved": "https://registry.npmjs.org/readable-stream/-/readable-stream-3.6.2.tgz",
+      "integrity": "sha512-9u/sniCrY3D5WdsERHzHE4G2YCXqoG5FTHUiCC4SIbr6XcLZBY05ya9EKjYek9O5xOAwjGq+1JdGBAS7Q9ScoA==",
+      "license": "MIT",
+      "dependencies": {
+        "inherits": "^2.0.3",
+        "string_decoder": "^1.1.1",
+        "util-deprecate": "^1.0.1"
+      },
+      "engines": {
+        "node": ">= 6"
+      }
     },
     "node_modules/convert-source-map": {
       "version": "2.0.0",
@@ -5411,7 +5935,6 @@ export default nextConfig;
       "version": "4.4.3",
       "resolved": "https://registry.npmjs.org/debug/-/debug-4.4.3.tgz",
       "integrity": "sha512-RGwwWnwQvkVfavKVt22FGLw+xYSdzARwm0ru6DhTVA3umU5hZc28V3kO4stgYryrTlLpuvgI9GiijltAjNbcqA==",
-      "dev": true,
       "license": "MIT",
       "dependencies": {
         "ms": "^2.1.3"
@@ -6205,6 +6728,24 @@ export default nextConfig;
         "node": ">=0.10.0"
       }
     },
+    "node_modules/event-target-shim": {
+      "version": "5.0.1",
+      "resolved": "https://registry.npmjs.org/event-target-shim/-/event-target-shim-5.0.1.tgz",
+      "integrity": "sha512-i/2XbnSz/uxRCU6+NdVJgKWDTM427+MqYbkQzD321DuCQJUqOuJKIA0IM2+W2xtYHdKOmZ4dR6fExsd4SXL+WQ==",
+      "license": "MIT",
+      "engines": {
+        "node": ">=6"
+      }
+    },
+    "node_modules/events": {
+      "version": "3.3.0",
+      "resolved": "https://registry.npmjs.org/events/-/events-3.3.0.tgz",
+      "integrity": "sha512-mQw+2fkQbALzQ7V0MY0IqdnXNOeTtP4r0lN9z7AAawCXgqea7bDii20AYrIBrFd/Hx0M2Ocz6S111CaFkUcb0Q==",
+      "license": "MIT",
+      "engines": {
+        "node": ">=0.8.x"
+      }
+    },
     "node_modules/fast-deep-equal": {
       "version": "3.1.3",
       "resolved": "https://registry.npmjs.org/fast-deep-equal/-/fast-deep-equal-3.1.3.tgz",
@@ -6255,6 +6796,19 @@ export default nextConfig;
       "integrity": "sha512-DCXu6Ifhqcks7TZKY3Hxp3y6qphY5SJZmrWMDrKcERSOXWQdMhU9Ig/PYrzyw/ul9jOIyh0N4M0tbC5hodg8dw==",
       "dev": true,
       "license": "MIT"
+    },
+    "node_modules/fast-unique-numbers": {
+      "version": "9.0.27",
+      "resolved": "https://registry.npmjs.org/fast-unique-numbers/-/fast-unique-numbers-9.0.27.tgz",
+      "integrity": "sha512-nDA9ADeINN8SA2u2wCtU+siWFTTDqQR37XvgPIDDmboWQeExz7X0mImxuaN+kJddliIqy2FpVRmnvRZ+j8i1/A==",
+      "license": "MIT",
+      "dependencies": {
+        "@babel/runtime": "^7.29.2",
+        "tslib": "^2.8.1"
+      },
+      "engines": {
+        "node": ">=18.2.0"
+      }
     },
     "node_modules/fastq": {
       "version": "1.20.3",
@@ -6652,6 +7206,12 @@ export default nextConfig;
         "node": ">= 0.4"
       }
     },
+    "node_modules/help-me": {
+      "version": "5.0.0",
+      "resolved": "https://registry.npmjs.org/help-me/-/help-me-5.0.0.tgz",
+      "integrity": "sha512-7xgomUX6ADmcYzFik0HzAxh/73YlKR9bmFzf51CZwR+b6YtzU2m0u49hQCqV6SvlqIqsaxovfwdvbnsw3b/zpg==",
+      "license": "MIT"
+    },
     "node_modules/hermes-estree": {
       "version": "0.25.1",
       "resolved": "https://registry.npmjs.org/hermes-estree/-/hermes-estree-0.25.1.tgz",
@@ -6668,6 +7228,26 @@ export default nextConfig;
       "dependencies": {
         "hermes-estree": "0.25.1"
       }
+    },
+    "node_modules/ieee754": {
+      "version": "1.2.1",
+      "resolved": "https://registry.npmjs.org/ieee754/-/ieee754-1.2.1.tgz",
+      "integrity": "sha512-dcyqhDvX1C46lXZcVqCpK+FtMRQVdIMN6/Df5js2zouUsqG7I6sFxitIC+7KYK29KdXOLHdu9zL4sFnoVQnqaA==",
+      "funding": [
+        {
+          "type": "github",
+          "url": "https://github.com/sponsors/feross"
+        },
+        {
+          "type": "patreon",
+          "url": "https://www.patreon.com/feross"
+        },
+        {
+          "type": "consulting",
+          "url": "https://feross.org/support"
+        }
+      ],
+      "license": "BSD-3-Clause"
     },
     "node_modules/ignore": {
       "version": "5.3.2",
@@ -6706,6 +7286,12 @@ export default nextConfig;
         "node": ">=0.8.19"
       }
     },
+    "node_modules/inherits": {
+      "version": "2.0.4",
+      "resolved": "https://registry.npmjs.org/inherits/-/inherits-2.0.4.tgz",
+      "integrity": "sha512-k/vGaX4/Yla3WzyMCvTQOXYeIHvqOKtnqBduzTHpzpQZzAskKMhZ2K+EnBiSM9zGSoIFeMpXKxa4dYeZIQqewQ==",
+      "license": "ISC"
+    },
     "node_modules/internal-slot": {
       "version": "1.1.0",
       "resolved": "https://registry.npmjs.org/internal-slot/-/internal-slot-1.1.0.tgz",
@@ -6719,6 +7305,15 @@ export default nextConfig;
       },
       "engines": {
         "node": ">= 0.4"
+      }
+    },
+    "node_modules/ip-address": {
+      "version": "10.7.6",
+      "resolved": "https://registry.npmjs.org/ip-address/-/ip-address-10.7.6.tgz",
+      "integrity": "sha512-00LYkM6byILa9eQIx6qoaXCM40xTLd56AZ4vyaPW3YTyb49VZYPo5xsiAq4tuQ54GH4R7gVdYScJ1B7B77PuTg==",
+      "license": "MIT",
+      "engines": {
+        "node": ">= 12"
       }
     },
     "node_modules/is-array-buffer": {
@@ -7720,17 +8315,63 @@ export default nextConfig;
       "version": "1.2.8",
       "resolved": "https://registry.npmjs.org/minimist/-/minimist-1.2.8.tgz",
       "integrity": "sha512-2yyAR8qBkN3YuheJanUpWC5U3bb5osDywNB8RzDVlDwDHbocAJveqqj1u8+SVD7jkWT4yvsHCpWqqWqAxb0zCA==",
-      "dev": true,
       "license": "MIT",
       "funding": {
         "url": "https://github.com/sponsors/ljharb"
       }
     },
+    "node_modules/mqtt": {
+      "version": "5.16.1",
+      "resolved": "https://registry.npmjs.org/mqtt/-/mqtt-5.16.1.tgz",
+      "integrity": "sha512-9aEaiR/mLblsMAiynD8quhcGTaINdta2bdyknAtfVzESfoe6Ncdh/uEs5p+3zqcTEtgYErwL4pNk0QkAynXxlg==",
+      "license": "MIT",
+      "dependencies": {
+        "@types/readable-stream": "^4.0.21",
+        "@types/ws": "^8.18.1",
+        "commist": "^3.2.0",
+        "concat-stream": "^2.0.0",
+        "debug": "^4.4.1",
+        "help-me": "^5.0.0",
+        "lru-cache": "^10.4.3",
+        "minimist": "^1.2.8",
+        "mqtt-packet": "^9.0.2",
+        "readable-stream": "^4.7.0",
+        "rfdc": "^1.4.1",
+        "socks": "^2.8.6",
+        "split2": "^4.2.0",
+        "worker-timers": "^8.0.23",
+        "ws": "^8.18.3"
+      },
+      "bin": {
+        "mqtt": "build/bin/mqtt.js",
+        "mqtt_pub": "build/bin/pub.js",
+        "mqtt_sub": "build/bin/sub.js"
+      },
+      "engines": {
+        "node": ">=16.0.0"
+      }
+    },
+    "node_modules/mqtt-packet": {
+      "version": "9.0.2",
+      "resolved": "https://registry.npmjs.org/mqtt-packet/-/mqtt-packet-9.0.2.tgz",
+      "integrity": "sha512-MvIY0B8/qjq7bKxdN1eD+nrljoeaai+qjLJgfRn3TiMuz0pamsIWY2bFODPZMSNmabsLANXsLl4EMoWvlaTZWA==",
+      "license": "MIT",
+      "dependencies": {
+        "bl": "^6.0.8",
+        "debug": "^4.3.4",
+        "process-nextick-args": "^2.0.1"
+      }
+    },
+    "node_modules/mqtt/node_modules/lru-cache": {
+      "version": "10.4.3",
+      "resolved": "https://registry.npmjs.org/lru-cache/-/lru-cache-10.4.3.tgz",
+      "integrity": "sha512-JNAzZcXrCt42VGLuYz0zfAzDfAvJWW6AfYlDBQyDV5DClI2m5sAmK+OIO7s59XfsRsWHp02jAJrRadPRGTt6SQ==",
+      "license": "ISC"
+    },
     "node_modules/ms": {
       "version": "2.1.3",
       "resolved": "https://registry.npmjs.org/ms/-/ms-2.1.3.tgz",
       "integrity": "sha512-6FlzubTLZG3J2a/NVCAleEhjzq5oxgHyaCU9yYXvcLsvoVaHJq/s5xXI6/XXP6tz7R9xAOtHnSO/tXtF3WRTlA==",
-      "dev": true,
       "license": "MIT"
     },
     "node_modules/nanoid": {
@@ -8339,6 +8980,21 @@ export default nextConfig;
         "node": ">= 0.8.0"
       }
     },
+    "node_modules/process": {
+      "version": "0.11.10",
+      "resolved": "https://registry.npmjs.org/process/-/process-0.11.10.tgz",
+      "integrity": "sha512-cdGef/drWFoydD1JsMzuFf8100nZl+GT+yacc2bEced5f9Rjk4z+WtFUTBu9PhOi9j/jfmBPu0mMEY4wIdAF8A==",
+      "license": "MIT",
+      "engines": {
+        "node": ">= 0.6.0"
+      }
+    },
+    "node_modules/process-nextick-args": {
+      "version": "2.0.1",
+      "resolved": "https://registry.npmjs.org/process-nextick-args/-/process-nextick-args-2.0.1.tgz",
+      "integrity": "sha512-3ouUOpQhtgrbOa17J7+uxOTpITYWaGP7/AhoR3+A+/1e9skrzelGi/dXzEYyvbxubEF6Wn2ypscTKiKJFFn1ag==",
+      "license": "MIT"
+    },
     "node_modules/prop-types": {
       "version": "15.8.1",
       "resolved": "https://registry.npmjs.org/prop-types/-/prop-types-15.8.1.tgz",
@@ -8409,6 +9065,22 @@ export default nextConfig;
       "integrity": "sha512-24e6ynE2H+OKt4kqsOvNd8kBpV65zoxbA4BVsEOB3ARVWQki/DHzaUoC5KuON/BiccDaCCTZBuOcfZs70kR8bQ==",
       "dev": true,
       "license": "MIT"
+    },
+    "node_modules/readable-stream": {
+      "version": "4.8.0",
+      "resolved": "https://registry.npmjs.org/readable-stream/-/readable-stream-4.8.0.tgz",
+      "integrity": "sha512-2jhTTU3Eilp/2DMT71gbcoqC35eQHasMJH0RHkYxwlxIv3+FR6Y5xAFZIwEGLxKkjZYEFlsiMNIdwUqjK2lLHQ==",
+      "license": "MIT",
+      "dependencies": {
+        "abort-controller": "^3.0.0",
+        "buffer": "^6.0.3",
+        "events": "^3.3.0",
+        "process": "^0.11.10",
+        "string_decoder": "^1.3.0"
+      },
+      "engines": {
+        "node": "^12.22.0 || ^14.17.0 || >=16.0.0"
+      }
     },
     "node_modules/reflect.getprototypeof": {
       "version": "1.0.10",
@@ -8509,6 +9181,12 @@ export default nextConfig;
         "node": ">=0.10.0"
       }
     },
+    "node_modules/rfdc": {
+      "version": "1.4.1",
+      "resolved": "https://registry.npmjs.org/rfdc/-/rfdc-1.4.1.tgz",
+      "integrity": "sha512-q1b3N5QkRUWUl7iyylaaj3kOpIT0N2i9MqIEQXP73GVsN9cw3fdx8X63cEmWhJGi2PPCF23Ijp7ktmd39rawIA==",
+      "license": "MIT"
+    },
     "node_modules/run-parallel": {
       "version": "1.2.0",
       "resolved": "https://registry.npmjs.org/run-parallel/-/run-parallel-1.2.0.tgz",
@@ -8552,6 +9230,26 @@ export default nextConfig;
       "funding": {
         "url": "https://github.com/sponsors/ljharb"
       }
+    },
+    "node_modules/safe-buffer": {
+      "version": "5.2.1",
+      "resolved": "https://registry.npmjs.org/safe-buffer/-/safe-buffer-5.2.1.tgz",
+      "integrity": "sha512-rp3So07KcdmmKbGvgaNxQSJr7bGVSVk5S9Eq1F+ppbRo70+YeaDxkw5Dd8NPN+GD6bjnYm2VuPuCXmpuYvmCXQ==",
+      "funding": [
+        {
+          "type": "github",
+          "url": "https://github.com/sponsors/feross"
+        },
+        {
+          "type": "patreon",
+          "url": "https://www.patreon.com/feross"
+        },
+        {
+          "type": "consulting",
+          "url": "https://feross.org/support"
+        }
+      ],
+      "license": "MIT"
     },
     "node_modules/safe-push-apply": {
       "version": "1.0.0",
@@ -8815,6 +9513,30 @@ export default nextConfig;
         "url": "https://github.com/sponsors/ljharb"
       }
     },
+    "node_modules/smart-buffer": {
+      "version": "4.2.0",
+      "resolved": "https://registry.npmjs.org/smart-buffer/-/smart-buffer-4.2.0.tgz",
+      "integrity": "sha512-94hK0Hh8rPqQl2xXc3HsaBoOXKV20MToPkcXvwbISWLEs+64sBq5kFgn2kJDHb1Pry9yrP0dxrCI9RRci7RXKg==",
+      "license": "MIT",
+      "engines": {
+        "node": ">= 6.0.0",
+        "npm": ">= 3.0.0"
+      }
+    },
+    "node_modules/socks": {
+      "version": "2.8.10",
+      "resolved": "https://registry.npmjs.org/socks/-/socks-2.8.10.tgz",
+      "integrity": "sha512-e0VyvkVTwVYViNovRkZ9aodhxVlyoMn7eJhVUPxZ+eK9P/7CBkxvvsBOHqFPEH416726W8tLXXXjKwqgTErrCQ==",
+      "license": "MIT",
+      "dependencies": {
+        "ip-address": "^10.1.1",
+        "smart-buffer": "^4.2.0"
+      },
+      "engines": {
+        "node": ">= 10.0.0",
+        "npm": ">= 3.0.0"
+      }
+    },
     "node_modules/source-map-js": {
       "version": "1.2.2",
       "resolved": "https://registry.npmjs.org/source-map-js/-/source-map-js-1.2.2.tgz",
@@ -8852,6 +9574,15 @@ export default nextConfig;
       },
       "engines": {
         "node": ">= 0.4"
+      }
+    },
+    "node_modules/string_decoder": {
+      "version": "1.3.0",
+      "resolved": "https://registry.npmjs.org/string_decoder/-/string_decoder-1.3.0.tgz",
+      "integrity": "sha512-hkRX8U1WjJFd8LsDJ2yQ/wWWxaopEsABU1XfkM8A+j0+85JAGppt16cr1Whg6KIbb4okU6Mql6BOj+uup/wKeA==",
+      "license": "MIT",
+      "dependencies": {
+        "safe-buffer": "~5.2.0"
       }
     },
     "node_modules/string.prototype.includes": {
@@ -9276,6 +10007,12 @@ export default nextConfig;
         "url": "https://github.com/sponsors/ljharb"
       }
     },
+    "node_modules/typedarray": {
+      "version": "0.0.6",
+      "resolved": "https://registry.npmjs.org/typedarray/-/typedarray-0.0.6.tgz",
+      "integrity": "sha512-/aCDEGatGvZ2BIk+HmLf4ifCJFwvKFNb9/JeZPMulfgFracn9QFcAf5GO8B/mweUjSoblS5In0cWhqpfs/5PQA==",
+      "license": "MIT"
+    },
     "node_modules/typescript": {
       "version": "5.9.3",
       "resolved": "https://registry.npmjs.org/typescript/-/typescript-5.9.3.tgz",
@@ -9337,7 +10074,6 @@ export default nextConfig;
       "version": "6.21.0",
       "resolved": "https://registry.npmjs.org/undici-types/-/undici-types-6.21.0.tgz",
       "integrity": "sha512-iwDZqg0QAGrg9Rav5H4n0M64c3mkR59cJ6wQp+7C4nI0gsmExaedaYLNO44eT4AtBBwjbTiGPMlt2Md0T9H9JQ==",
-      "dev": true,
       "license": "MIT"
     },
     "node_modules/unrs-resolver": {
@@ -9416,6 +10152,12 @@ export default nextConfig;
       "dependencies": {
         "punycode": "^2.1.0"
       }
+    },
+    "node_modules/util-deprecate": {
+      "version": "1.0.2",
+      "resolved": "https://registry.npmjs.org/util-deprecate/-/util-deprecate-1.0.2.tgz",
+      "integrity": "sha512-EPD5q1uXyFxJpCrLnCc1nHnq3gOa6DZBocAIiI2TaSCA7VCJ1UJDMagCzIkXNsUYfD1daK//LTEQ8xiIbrHtcw==",
+      "license": "MIT"
     },
     "node_modules/which": {
       "version": "2.0.2",
@@ -9532,6 +10274,74 @@ export default nextConfig;
         "node": ">=0.10.0"
       }
     },
+    "node_modules/worker-factory": {
+      "version": "7.0.50",
+      "resolved": "https://registry.npmjs.org/worker-factory/-/worker-factory-7.0.50.tgz",
+      "integrity": "sha512-hhwc0G+sFwM4qBuhJIUBn2p1Jf8v/FwmLUANBf/Q+Lt2uI8mfIZQhXaZQACodQD4R7Zp6cn/6702bIvNn2puJQ==",
+      "license": "MIT",
+      "dependencies": {
+        "@babel/runtime": "^7.29.7",
+        "fast-unique-numbers": "^9.0.27",
+        "tslib": "^2.8.1"
+      }
+    },
+    "node_modules/worker-timers": {
+      "version": "8.0.34",
+      "resolved": "https://registry.npmjs.org/worker-timers/-/worker-timers-8.0.34.tgz",
+      "integrity": "sha512-WXL+Dqsm0G6dnC66rQsvM3tPT2adhbqSirWUCZGglkALOr8ocS0KlpU0iuKbjflJOlu3ydZikMEVrYnHOM9suw==",
+      "license": "MIT",
+      "dependencies": {
+        "@babel/runtime": "^7.29.7",
+        "tslib": "^2.8.1",
+        "worker-timers-broker": "^8.0.18",
+        "worker-timers-worker": "^9.0.15"
+      }
+    },
+    "node_modules/worker-timers-broker": {
+      "version": "8.0.18",
+      "resolved": "https://registry.npmjs.org/worker-timers-broker/-/worker-timers-broker-8.0.18.tgz",
+      "integrity": "sha512-FrjzDVX1wKfZN0gRbCFqv8VHuTncG4sbI/WGEg4tSSQeIsnwqg4YBYWMAHYLJtUDEYYmiK65UKFrVMVk2irDSg==",
+      "license": "MIT",
+      "dependencies": {
+        "@babel/runtime": "^7.29.7",
+        "broker-factory": "^3.1.15",
+        "fast-unique-numbers": "^9.0.27",
+        "tslib": "^2.8.1",
+        "worker-timers-worker": "^9.0.15"
+      }
+    },
+    "node_modules/worker-timers-worker": {
+      "version": "9.0.15",
+      "resolved": "https://registry.npmjs.org/worker-timers-worker/-/worker-timers-worker-9.0.15.tgz",
+      "integrity": "sha512-KKUe7lZ/Aignr51H6hOUik8LwTnIgojH/1lwhli8A8qIEIyewogZTpNpMW5B6BF7nmwBOkUoTYgf1H3QShcjSA==",
+      "license": "MIT",
+      "dependencies": {
+        "@babel/runtime": "^7.29.7",
+        "tslib": "^2.8.1",
+        "worker-factory": "^7.0.50"
+      }
+    },
+    "node_modules/ws": {
+      "version": "8.23.0",
+      "resolved": "https://registry.npmjs.org/ws/-/ws-8.23.0.tgz",
+      "integrity": "sha512-wCkmX8QMOrKjgO8HW2WyDbTSGeqkocxgDzS9iR79rEAexty6/2qzilx3Ag8Tqf9ykop3irLKle0MtVn5qjVnoQ==",
+      "license": "MIT",
+      "engines": {
+        "node": ">=10.0.0"
+      },
+      "peerDependencies": {
+        "bufferutil": "^4.0.1",
+        "utf-8-validate": ">=5.0.2"
+      },
+      "peerDependenciesMeta": {
+        "bufferutil": {
+          "optional": true
+        },
+        "utf-8-validate": {
+          "optional": true
+        }
+      }
+    },
     "node_modules/xtend": {
       "version": "4.0.2",
       "resolved": "https://registry.npmjs.org/xtend/-/xtend-4.0.2.tgz",
@@ -9608,6 +10418,7 @@ export default nextConfig;
   },
   "dependencies": {
     "bcryptjs": "^3.0.3",
+    "mqtt": "^5.16.1",
     "next": "16.4.6",
     "next-auth": "^5.0.0-beta.32",
     "pg": "^8.23.1",
@@ -9705,7 +10516,7 @@ const accounts = [
 async function main() {
   loadEnvConfig(process.cwd());
 
-  const { env } = await import("../.environment");
+  const { env } = await import("../environment");
   const pool = new Pool({
     connectionString: env.POSTGRESS_SERVER,
     max: 1,
@@ -9799,7 +10610,7 @@ import { Pool } from "pg";
 async function main() {
   loadEnvConfig(process.cwd());
 
-  const { env } = await import("../.environment");
+  const { env } = await import("../environment");
   if (env.SEED_CONFIRM !== "CREATE_FASTROBOX_TEST_USERS") {
     throw new Error(
       "Set SEED_CONFIRM=CREATE_FASTROBOX_TEST_USERS after verifying the target database.",
